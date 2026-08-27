@@ -25,11 +25,20 @@ case "$(uname -s)" in
     Linux)
         readonly SPC_PLATFORM="linux"
         case "${TARGET}" in
-            "${SPC_ARCH}"-unknown-linux-gnu|"${SPC_ARCH}"-unknown-linux-musl)
+            "${SPC_ARCH}"-unknown-linux-gnu)
+                readonly EXPECTED_SPC_LIBC="glibc"
+                readonly HOST_TARGET="${TARGET}"
+                ;;
+            "${SPC_ARCH}"-unknown-linux-musl)
+                readonly EXPECTED_SPC_LIBC="musl"
                 readonly HOST_TARGET="${TARGET}"
                 ;;
             *) echo "Target ${TARGET} does not match this Linux host" >&2; exit 1 ;;
         esac
+        if [[ "${SPC_LIBC:-}" != "${EXPECTED_SPC_LIBC}" ]]; then
+            echo "SPC_LIBC=${EXPECTED_SPC_LIBC} is required for ${TARGET}" >&2
+            exit 1
+        fi
         ;;
     *) echo "Unsupported build host: $(uname -s)" >&2; exit 1 ;;
 esac

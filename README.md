@@ -26,11 +26,13 @@ To build PHP and its dependencies through static-php-cli first:
 
 ```bash
 PHP_VERSION=8.5 \
+SPC_LIBC=glibc \
 TARGET=x86_64-unknown-linux-gnu \
 ./scripts/build-php-runtime.sh
 ```
 
-On macOS, use `x86_64-apple-darwin` or `aarch64-apple-darwin` as the target.
+On macOS, omit `SPC_LIBC` and use `x86_64-apple-darwin` or
+`aarch64-apple-darwin` as the target.
 
 The runtime targets PHP 8.4 and 8.5 on Linux glibc/musl and macOS for x86_64
 and aarch64. Release archives include runtime metadata and license notices.
