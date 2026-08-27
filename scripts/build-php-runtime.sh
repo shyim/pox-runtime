@@ -24,11 +24,12 @@ case "$(uname -s)" in
         ;;
     Linux)
         readonly SPC_PLATFORM="linux"
-        if ldd --version 2>&1 | grep -qi musl; then
-            readonly HOST_TARGET="${SPC_ARCH}-unknown-linux-musl"
-        else
-            readonly HOST_TARGET="${SPC_ARCH}-unknown-linux-gnu"
-        fi
+        case "${TARGET}" in
+            "${SPC_ARCH}"-unknown-linux-gnu|"${SPC_ARCH}"-unknown-linux-musl)
+                readonly HOST_TARGET="${TARGET}"
+                ;;
+            *) echo "Target ${TARGET} does not match this Linux host" >&2; exit 1 ;;
+        esac
         ;;
     *) echo "Unsupported build host: $(uname -s)" >&2; exit 1 ;;
 esac
