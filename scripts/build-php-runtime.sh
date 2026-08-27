@@ -35,7 +35,6 @@ export SPC_REL_TYPE="binary"
     --build-embed \
     --enable-zts \
     --with-libs="${PHP_BUILD_LIBS}" \
-    --with-clean \
     --no-interaction
 
 PHP_CONFIG="${PWD}/buildroot/bin/php-config" \
