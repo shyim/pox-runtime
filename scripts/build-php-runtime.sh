@@ -37,13 +37,13 @@ export SPC_REL_TYPE="binary"
     --with-libs="${PHP_BUILD_LIBS}" \
     --no-interaction
 
-PHP_CONFIG="${PWD}/buildroot/bin/php-config" \
-BUILD_DIR="${BUILD_DIR}" \
-RUNTIME_REVISION="${RUNTIME_REVISION}" \
-TARGET="${TARGET}" \
+env PHP_CONFIG="${PWD}/buildroot/bin/php-config" \
+    BUILD_DIR="${BUILD_DIR}" \
+    RUNTIME_REVISION="${RUNTIME_REVISION}" \
+    TARGET="${TARGET}" \
     ./scripts/build-runtime.sh
-PHP_CONFIG="${PWD}/buildroot/bin/php-config" \
-BUILD_DIR="${BUILD_DIR}" \
-RUNTIME_REVISION="${RUNTIME_REVISION}" \
-TARGET="${TARGET}" \
+env PHP_CONFIG="${PWD}/buildroot/bin/php-config" \
+    BUILD_DIR="${BUILD_DIR}" \
+    RUNTIME_REVISION="${RUNTIME_REVISION}" \
+    TARGET="${TARGET}" \
     ./scripts/package-runtime.sh
