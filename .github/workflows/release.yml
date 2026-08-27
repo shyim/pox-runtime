@@ -109,7 +109,10 @@ jobs:
           PHP_VERSION: ${{ matrix.php_version }}
           RUNTIME_REVISION: ${{ needs.discover.outputs.revision }}
           TARGET: ${{ matrix.target }}
-        run: ./scripts/build-php-runtime.sh
+        run: |
+          ./scripts/build-php-runtime.sh
+          mkdir -p dist
+          cp build/*.tar.zst dist/
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-${{ matrix.php_version }}-${{ matrix.target }}
