@@ -1,0 +1,142 @@
+name: Publish PHP runtimes
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      php_version:
+        description: Exact PHP version; empty builds the latest 8.4 and 8.5 releases
+        required: false
+        type: string
+      runtime_revision:
+        description: Runtime adapter revision
+        default: r1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+      revision: ${{ steps.versions.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: versions
+        env:
+          REQUESTED_VERSION: ${{ inputs.php_version }}
+          REQUESTED_REVISION: ${{ inputs.runtime_revision }}
+        run: |
+          if [[ -n "${REQUESTED_VERSION}" ]]; then
+            versions="[\"${REQUESTED_VERSION}\"]"
+          else
+            versions="$(scripts/discover-versions.py)"
+          fi
+          echo "versions=${versions}" >> "${GITHUB_OUTPUT}"
+          echo "revision=${REQUESTED_REVISION:-r1}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        php_version: ${{ fromJSON(needs.discover.outputs.versions) }}
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            libc: glibc
+            dockerfile: Dockerfile.glibc
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            libc: glibc
+            dockerfile: Dockerfile.glibc
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            libc: musl
+            dockerfile: Dockerfile.musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            libc: musl
+            dockerfile: Dockerfile.musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and test runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          outputs: type=local,dest=dist
+          build-args: |
+            PHP_VERSION=${{ matrix.php_version }}
+            RUNTIME_REVISION=${{ needs.discover.outputs.revision }}
+            TARGET=${{ matrix.target }}
+          secrets: |
+            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.php_version }}-${{ matrix.target }}
+          path: dist/*.tar.zst
+          if-no-files-found: error
+
+  publish:
+    needs: [discover, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          path: dist
+          merge-multiple: true
+      - name: Publish immutable runtime releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSIONS: ${{ needs.discover.outputs.versions }}
+          REVISION: ${{ needs.discover.outputs.revision }}
+        run: |
+          for version in $(python3 -c 'import json, os; print(" ".join(json.loads(os.environ["VERSIONS"])))'); do
+            python3 scripts/create-release-manifest.py \
+              --directory dist \
+              --php-version "${version}" \
+              --runtime-revision "${REVISION}" \
+              --repository "${GITHUB_REPOSITORY}" \
+              --output dist/release.json
+            tag="php-${version}-${REVISION}"
+            if gh release view "${tag}" >/dev/null 2>&1; then
+              echo "${tag} already exists; keeping immutable release assets"
+            else
+              gh release create "${tag}" dist/pox-php-${version}-${REVISION}-*.tar.zst dist/release.json \
+                --title "PHP ${version} runtime ${REVISION}" \
+                --notes "Self-contained ZTS/embed PHP ${version} runtimes for Pox."
+            fi
+          done
+      - name: Build and sign channel index
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNTIME_INDEX_SIGNING_KEY: ${{ secrets.RUNTIME_INDEX_SIGNING_KEY }}
+        run: |
+          python3 scripts/build-index.py --repository "${GITHUB_REPOSITORY}" --output dist/index.json
+          scripts/sign-index.sh dist/index.json dist/index.json.sig
+      - name: Publish signed channel index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view runtime-index >/dev/null 2>&1; then
+            gh release upload runtime-index dist/index.json dist/index.json.sig --clobber
+          else
+            gh release create runtime-index dist/index.json dist/index.json.sig \
+              --title "Signed runtime channel index" \
+              --notes "Machine-readable signed index used by pox php install."
+          fi

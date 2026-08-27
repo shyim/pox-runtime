@@ -1,0 +1,6 @@
+/.git
+/build
+/.spc
+__pycache__
+*.pem
+*.key

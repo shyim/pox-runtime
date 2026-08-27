@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+FROM debian:bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf automake bash bison build-essential ca-certificates cmake curl \
+        file flex git libtool make openssl patch pkg-config python3 re2c unzip xz-utils zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+COPY . .
+ARG PHP_VERSION
+ARG RUNTIME_REVISION=r1
+ARG TARGET
+ENV PHP_VERSION=${PHP_VERSION} RUNTIME_REVISION=${RUNTIME_REVISION} TARGET=${TARGET} SPC_LIBC=glibc
+RUN --mount=type=secret,id=GITHUB_TOKEN,env=GITHUB_TOKEN ./scripts/build-php-runtime.sh
+
+FROM scratch
+COPY --from=builder /work/build/*.tar.zst /

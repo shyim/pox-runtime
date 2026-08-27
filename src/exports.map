@@ -1,0 +1,6 @@
+POX_PHP_1.0 {
+    global:
+        pox_php_get_api;
+    local:
+        *;
+};

@@ -1,0 +1,5 @@
+/build/
+/.spc/
+*.key
+*.pem
+__pycache__/

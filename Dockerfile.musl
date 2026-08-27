@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+FROM alpine:3.22 AS builder
+
+RUN apk add --no-cache \
+        autoconf automake bash bison build-base ca-certificates cmake curl file \
+        flex git libtool linux-headers make openssl patch pkgconf python3 re2c \
+        tar unzip xz zstd
+
+WORKDIR /work
+COPY . .
+ARG PHP_VERSION
+ARG RUNTIME_REVISION=r1
+ARG TARGET
+ENV PHP_VERSION=${PHP_VERSION} RUNTIME_REVISION=${RUNTIME_REVISION} TARGET=${TARGET} SPC_LIBC=musl
+RUN --mount=type=secret,id=GITHUB_TOKEN,env=GITHUB_TOKEN ./scripts/build-php-runtime.sh
+
+FROM scratch
+COPY --from=builder /work/build/*.tar.zst /
