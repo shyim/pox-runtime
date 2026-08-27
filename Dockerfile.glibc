@@ -2,7 +2,7 @@
 FROM debian:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        autoconf automake bash bison build-essential ca-certificates cmake curl \
+        autoconf automake autopoint bash bison build-essential ca-certificates cmake curl \
         file flex git libtool make openssl patch pkg-config python3 re2c unzip xz-utils zstd \
     && rm -rf /var/lib/apt/lists/*
 
