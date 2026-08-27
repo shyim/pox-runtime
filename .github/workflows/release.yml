@@ -11,7 +11,7 @@ on:
         type: string
       runtime_revision:
         description: Runtime adapter revision
-        default: r1
+        default: r2
         required: true
         type: string
 
@@ -37,7 +37,7 @@ jobs:
             versions="$(scripts/discover-versions.py)"
           fi
           echo "versions=${versions}" >> "${GITHUB_OUTPUT}"
-          echo "revision=${REQUESTED_REVISION:-r1}" >> "${GITHUB_OUTPUT}"
+          echo "revision=${REQUESTED_REVISION:-r2}" >> "${GITHUB_OUTPUT}"
 
   build:
     needs: discover
@@ -50,28 +50,42 @@ jobs:
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
+            platform: linux
             libc: glibc
             dockerfile: Dockerfile.glibc
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            platform: linux
             libc: glibc
             dockerfile: Dockerfile.glibc
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+            platform: linux
             libc: musl
             dockerfile: Dockerfile.musl
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            platform: linux
             libc: musl
             dockerfile: Dockerfile.musl
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            platform: macos
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            platform: macos
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
+      - if: matrix.platform == 'linux'
+        uses: docker/setup-buildx-action@v3
       - name: Build and test runtime
+        if: matrix.platform == 'linux'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -84,6 +98,18 @@ jobs:
             TARGET=${{ matrix.target }}
           secrets: |
             GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+      - name: Install macOS build prerequisites
+        if: matrix.platform == 'macos'
+        run: brew install autoconf automake bison cmake coreutils gnu-sed libtool pkg-config re2c zstd
+      - name: Build and test macOS runtime
+        if: matrix.platform == 'macos'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+          PHP_VERSION: ${{ matrix.php_version }}
+          RUNTIME_REVISION: ${{ needs.discover.outputs.revision }}
+          TARGET: ${{ matrix.target }}
+        run: ./scripts/build-php-runtime.sh
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-${{ matrix.php_version }}-${{ matrix.target }}

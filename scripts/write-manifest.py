@@ -22,7 +22,7 @@ manifest = {
     "runtime_revision": args.runtime_revision,
     "target": args.target,
     "zts": True,
-    "library": "libpox_php.so",
+    "library": args.library.name,
     "library_sha256": hashlib.sha256(args.library.read_bytes()).hexdigest(),
 }
 args.output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

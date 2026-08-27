@@ -8,11 +8,14 @@ on:
 
 jobs:
   source:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - name: Validate scripts
         run: |
           bash -n scripts/*.sh tests/*.sh
           python3 -m compileall -q scripts
-          cc -std=gnu11 -D_GNU_SOURCE -Iinclude -fsyntax-only tests/smoke.c
+          cc -std=c11 -Iinclude -fsyntax-only tests/smoke.c

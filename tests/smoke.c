@@ -7,6 +7,15 @@
 
 typedef const pox_php_api_v1 *(*get_api_fn)(uint32_t, uint32_t);
 
+static int buffer_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
+    size_t needle_len = strlen(needle);
+    if (needle_len > haystack_len) return 0;
+    for (size_t offset = 0; offset <= haystack_len - needle_len; offset++) {
+        if (memcmp(haystack + offset, needle, needle_len) == 0) return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
@@ -23,7 +32,7 @@ int main(int argc, char **argv) {
     if (api->metadata_json(&metadata) != POX_STATUS_OK) return 1;
     fwrite(metadata.data, 1, metadata.len, stdout);
     fputc('\n', stdout);
-    if (memmem(metadata.data, metadata.len, "\"zts\":true", 10) == NULL) return 1;
+    if (!buffer_contains(metadata.data, metadata.len, "\"zts\":true")) return 1;
     api->free_buffer(&metadata);
 
     static const char code[] = "echo 'runtime-ok';";
