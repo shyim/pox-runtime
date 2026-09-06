@@ -49,11 +49,33 @@
 /* Register CLI-specific variables in $_SERVER */
 static char *pox_script_filename = NULL;
 static char *pox_ini_entries = NULL;
+static char *pox_http_ini_entries = NULL;
 
 /* Configuration survives mode transitions, but not unloading this library. */
 __attribute__((destructor)) static void pox_release_configuration(void) {
     free(pox_ini_entries);
     pox_ini_entries = NULL;
+    free(pox_http_ini_entries);
+    pox_http_ini_entries = NULL;
+}
+
+/* Process-wide PHP timers cannot isolate concurrent ZTS requests. Match
+ * FrankenPHP's policy on builds without Zend's per-thread execution timers;
+ * the HTTP host supplies request-scoped deadlines and cancellation instead. */
+static int pox_prepare_http_ini(void) {
+    free(pox_http_ini_entries);
+    pox_http_ini_entries = NULL;
+#if defined(ZTS) && !defined(ZEND_MAX_EXECUTION_TIMERS)
+    const char *entries = pox_ini_entries != NULL ? pox_ini_entries : "";
+    const char overrides[] = "\nmax_execution_time=0\nmax_input_time=-1\n";
+    size_t length = strlen(entries);
+    if (length > SIZE_MAX - sizeof(overrides)) return 0;
+    pox_http_ini_entries = malloc(length + sizeof(overrides));
+    if (pox_http_ini_entries == NULL) return 0;
+    memcpy(pox_http_ini_entries, entries, length);
+    memcpy(pox_http_ini_entries + length, overrides, sizeof(overrides));
+#endif
+    return 1;
 }
 
 static void pox_register_variables(zval *track_vars_array) {
@@ -138,6 +160,15 @@ static void pox_apply_ini_entries(void) {
             *eq = '\0';
             char *key = line;
             char *value = eq + 1;
+
+#if defined(ZTS) && !defined(ZEND_MAX_EXECUTION_TIMERS)
+            if ((strcmp(sapi_module.name, "pox") == 0 ||
+                 strcmp(sapi_module.name, "pox-worker") == 0) &&
+                (strcmp(key, "max_execution_time") == 0 || strcmp(key, "max_input_time") == 0)) {
+                line = strtok_r(NULL, "\n", &cursor);
+                continue;
+            }
+#endif
 
             zend_string *key_str = zend_string_init(key, strlen(key), 0);
             zend_alter_ini_entry_chars(key_str, value, strlen(value),
@@ -1253,6 +1284,7 @@ int pox_web_init(void) {
     if (pox_web_initialized) {
         return 0;
     }
+    if (!pox_prepare_http_ini()) return 1;
 
 #ifdef ZTS
     php_tsrm_startup();
@@ -1262,7 +1294,7 @@ int pox_web_init(void) {
 
     sapi_startup(&pox_web_sapi_module);
 
-    pox_web_sapi_module.ini_entries = pox_ini_entries;
+    pox_web_sapi_module.ini_entries = pox_http_ini_entries != NULL ? pox_http_ini_entries : pox_ini_entries;
 
     if (pox_web_sapi_module.startup(&pox_web_sapi_module) == FAILURE) {
         return 1;
@@ -1731,6 +1763,7 @@ int pox_worker_global_init(void) {
     if (pox_worker_global_initialized) {
         return 0;
     }
+    if (!pox_prepare_http_ini()) return 1;
 
 #ifdef ZTS
     php_tsrm_startup();
@@ -1740,7 +1773,7 @@ int pox_worker_global_init(void) {
 
     sapi_startup(&pox_worker_sapi_module);
 
-    pox_worker_sapi_module.ini_entries = pox_ini_entries;
+    pox_worker_sapi_module.ini_entries = pox_http_ini_entries != NULL ? pox_http_ini_entries : pox_ini_entries;
 
     if (pox_worker_sapi_module.startup(&pox_worker_sapi_module) == FAILURE) {
         return 1;
