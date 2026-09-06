@@ -7,6 +7,8 @@ readonly TARGET="${TARGET:?TARGET is required}"
 readonly RUNTIME_REVISION="${RUNTIME_REVISION:?RUNTIME_REVISION is required}"
 readonly PHP_CONFIG="${PHP_CONFIG:-php-config}"
 readonly PHP_VERSION="$("${PHP_CONFIG}" --version)"
+readonly PHP_PREFIX="$("${PHP_CONFIG}" --prefix)"
+readonly PHP_LICENSE_DIR="${PHP_LICENSE_DIR:-${PHP_PREFIX}/license}"
 readonly PACKAGE_NAME="pox-php-${PHP_VERSION}-${RUNTIME_REVISION}-${TARGET}"
 readonly STAGE_DIR="${BUILD_DIR}/${PACKAGE_NAME}"
 
@@ -21,14 +23,14 @@ mkdir -p "${STAGE_DIR}/licenses"
 cp "${BUILD_DIR}/${LIBRARY_NAME}" "${STAGE_DIR}/${LIBRARY_NAME}"
 cp LICENSE "${STAGE_DIR}/licenses/pox-runtime-MIT.txt"
 
-if [[ -d "${SPC_DIR:-.spc}/source" ]]; then
-    while IFS= read -r license; do
-        license_name="${license#${SPC_DIR:-.spc}/source/}"
-        license_name="${license_name//\//-}"
-        cp "${license}" "${STAGE_DIR}/licenses/${license_name}"
-    done < <(find "${SPC_DIR:-.spc}/source" -maxdepth 3 -type f \
-        \( -iname 'license' -o -iname 'license.*' -o -iname 'copying' \) | sort)
+# SPC collects the licenses for the actual selected PHP/extensions/libraries in
+# its SDK prefix. The download tool's own .spc directory is not the build tree.
+if [[ ! -d "${PHP_LICENSE_DIR}" ]] || [[ -z "$(find "${PHP_LICENSE_DIR}" -type f -print -quit)" ]]; then
+    echo "PHP SDK license files are missing: ${PHP_LICENSE_DIR}. Set PHP_LICENSE_DIR to the collected notices before packaging." >&2
+    exit 1
 fi
+mkdir -p "${STAGE_DIR}/licenses/php"
+cp -R "${PHP_LICENSE_DIR}/." "${STAGE_DIR}/licenses/php/"
 
 python3 scripts/write-manifest.py \
     --library "${STAGE_DIR}/${LIBRARY_NAME}" \

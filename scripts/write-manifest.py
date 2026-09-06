@@ -17,7 +17,7 @@ args = parser.parse_args()
 manifest = {
     "schema": 1,
     "abi_major": 1,
-    "abi_minor": 0,
+    "abi_minor": 1,
     "php_version": args.php_version,
     "runtime_revision": args.runtime_revision,
     "target": args.target,

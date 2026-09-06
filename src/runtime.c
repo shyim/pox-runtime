@@ -10,11 +10,18 @@
 #include <string.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <pthread.h>
 
 #include "pox_php_runtime.h"
+#include "response_buffer.h"
 
 #include <sapi/embed/php_embed.h>
 #include <php.h>
+#ifdef HAVE_PHP_SESSION
+#include <ext/session/php_session.h>
+#endif
+#include <ext/standard/url.h>
 #include <php_main.h>
 #include <php_variables.h>
 #include <php_output.h>
@@ -25,6 +32,8 @@
 #include <Zend/zend_compile.h>
 #include <Zend/zend_extensions.h>
 #include <ext/standard/info.h>
+#include <ext/standard/file.h>
+#include <main/php_memory_streams.h>
 #include <ext/spl/spl_exceptions.h>
 #include <unicode/uvernum.h>
 #include <libxml/xmlversion.h>
@@ -40,6 +49,12 @@
 /* Register CLI-specific variables in $_SERVER */
 static char *pox_script_filename = NULL;
 static char *pox_ini_entries = NULL;
+
+/* Configuration survives mode transitions, but not unloading this library. */
+__attribute__((destructor)) static void pox_release_configuration(void) {
+    free(pox_ini_entries);
+    pox_ini_entries = NULL;
+}
 
 static void pox_register_variables(zval *track_vars_array) {
     /* Import environment variables */
@@ -113,7 +128,9 @@ static void pox_apply_ini_entries(void) {
     }
 
     char *entries = strdup(pox_ini_entries);
-    char *line = strtok(entries, "\n");
+    if (entries == NULL) zend_bailout();
+    char *cursor = NULL;
+    char *line = strtok_r(entries, "\n", &cursor);
 
     while (line != NULL) {
         char *eq = strchr(line, '=');
@@ -127,7 +144,7 @@ static void pox_apply_ini_entries(void) {
                                        ZEND_INI_USER, ZEND_INI_STAGE_RUNTIME);
             zend_string_release(key_str);
         }
-        line = strtok(NULL, "\n");
+        line = strtok_r(NULL, "\n", &cursor);
     }
 
     free(entries);
@@ -481,8 +498,90 @@ void pox_free_string(char *str) {
  * Web/Server Mode - Custom SAPI for handling HTTP requests
  * ============================================================================ */
 
+/* The control owns no PHP globals. Its mutex fences interrupt writes against
+ * detachment before TSRM teardown. Reference ownership spans worker callbacks
+ * which may release the host request before native cleanup finishes. */
+typedef struct {
+    pthread_mutex_t mutex;
+    atomic_uint references;
+    int cancelled;
+    int used;
+    zend_atomic_bool *interrupt;
+    zend_atomic_bool *timed_out;
+} pox_cancellation;
+
+static int32_t pox_cancellation_create(void **output) {
+    if (output == NULL) return POX_STATUS_INVALID_ARGUMENT;
+    *output = NULL;
+    pox_cancellation *control = calloc(1, sizeof(*control));
+    if (control == NULL) return POX_STATUS_OUT_OF_MEMORY;
+    if (pthread_mutex_init(&control->mutex, NULL) != 0) {
+        free(control);
+        return POX_STATUS_INTERNAL_ERROR;
+    }
+    atomic_init(&control->references, 1);
+    *output = control;
+    return POX_STATUS_OK;
+}
+
+static void pox_cancellation_release(void *value) {
+    pox_cancellation *control = value;
+    if (control != NULL && atomic_fetch_sub(&control->references, 1) == 1) {
+        pthread_mutex_destroy(&control->mutex);
+        free(control);
+    }
+}
+
+static void pox_cancellation_request(void *value) {
+    pox_cancellation *control = value;
+    if (control == NULL) return;
+    pthread_mutex_lock(&control->mutex);
+    control->cancelled = 1;
+    if (control->interrupt != NULL) {
+        zend_atomic_bool_store(control->timed_out, true);
+        zend_atomic_bool_store(control->interrupt, true);
+    }
+    pthread_mutex_unlock(&control->mutex);
+}
+
+static int pox_cancellation_bind(pox_cancellation *control) {
+    if (control == NULL) return 1;
+    pthread_mutex_lock(&control->mutex);
+    int allowed = !control->used && !control->cancelled;
+    control->used = 1;
+    if (allowed) {
+        control->interrupt = &EG(vm_interrupt);
+        control->timed_out = &EG(timed_out);
+    }
+    pthread_mutex_unlock(&control->mutex);
+    return allowed;
+}
+
+static void pox_cancellation_detach(pox_cancellation *control) {
+    if (control == NULL) return;
+    pthread_mutex_lock(&control->mutex);
+    control->interrupt = NULL;
+    control->timed_out = NULL;
+    pthread_mutex_unlock(&control->mutex);
+}
+
+static int pox_cancellation_requested(pox_cancellation *control) {
+    if (control == NULL) return 0;
+    pthread_mutex_lock(&control->mutex);
+    int cancelled = control->cancelled;
+    pthread_mutex_unlock(&control->mutex);
+    return cancelled;
+}
+
 /* Request context passed from Rust */
 typedef struct {
+    const pox_output_callbacks_v1 *output;
+    size_t output_bytes;
+    int output_started;
+    int output_failed;
+    pox_cancellation *cancellation;
+    int cancellation_rejected;
+    int cancellation_bound;
     /* Request info */
     const char *method;
     const char *uri;
@@ -492,9 +591,11 @@ typedef struct {
     const char *request_body;
     size_t request_body_len;
     size_t request_body_read;
+    char *request_cookie_data;
 
     /* Headers (key=value pairs, newline separated) */
     const char *headers;
+    const char *authorization;
 
     /* Document root and script */
     const char *document_root;
@@ -505,6 +606,8 @@ typedef struct {
     int server_port;
     const char *remote_addr;
     int remote_port;
+    int protocol_num;
+    int secure;
 
     /* Response output buffer */
     char *response_body;
@@ -515,6 +618,11 @@ typedef struct {
     char *response_headers;
     size_t response_headers_len;
     size_t response_headers_cap;
+
+    /* Native output allocations never exceed these per-request bounds. */
+    size_t max_response_body;
+    size_t max_response_headers;
+    int response_buffer_failed;
 
     /* Response status */
     int response_status;
@@ -529,6 +637,7 @@ typedef struct {
     char *query_string;
     char *content_type;
     char *headers;
+    char *authorization;
     char *document_root;
     char *script_filename;
     char *server_name;
@@ -546,15 +655,15 @@ static char *pox_slice_string(pox_slice_v1 value) {
     return result;
 }
 
-static char *pox_content_type(const char *headers) {
+static char *pox_header_value(const char *headers, const char *prefix) {
     if (headers == NULL) return strdup("");
     const char *line = headers;
     while (*line != '\0') {
         const char *end = strchr(line, '\n');
         size_t len = end ? (size_t)(end - line) : strlen(line);
-        static const char prefix[] = "Content-Type:";
-        if (len >= sizeof(prefix) - 1 && strncasecmp(line, prefix, sizeof(prefix) - 1) == 0) {
-            const char *value = line + sizeof(prefix) - 1;
+        size_t prefix_len = strlen(prefix);
+        if (len >= prefix_len && strncasecmp(line, prefix, prefix_len) == 0) {
+            const char *value = line + prefix_len;
             while (value < line + len && (*value == ' ' || *value == '\t')) value++;
             size_t value_len = (size_t)((line + len) - value);
             char *result = malloc(value_len + 1);
@@ -572,21 +681,25 @@ static char *pox_content_type(const char *headers) {
 static void pox_owned_request_free(pox_owned_request *request, int free_response) {
     if (request == NULL) return;
     if (free_response) pox_free_response(&request->context);
+    pox_cancellation_release(request->context.cancellation);
     free(request->method);
     free(request->uri);
     free(request->query_string);
     free(request->content_type);
     free(request->headers);
+    free(request->authorization);
     free(request->document_root);
     free(request->script_filename);
     free(request->server_name);
     free(request->remote_addr);
     free(request->body);
+    free(request->context.request_cookie_data);
     memset(request, 0, sizeof(*request));
 }
 
 static int pox_owned_request_init(pox_owned_request *owned, const pox_http_request_v1 *request) {
     if (owned == NULL || request == NULL || request->struct_size < sizeof(*request)) return 0;
+    if ((request->reserved0 & POX_HTTP_PROTOCOL) && request->reserved[2] != 1000 && request->reserved[2] != 1001) return 0;
     if ((request->method.len > 0 && request->method.data == NULL) ||
         (request->uri.len > 0 && request->uri.data == NULL) ||
         (request->query_string.len > 0 && request->query_string.data == NULL) ||
@@ -605,7 +718,8 @@ static int pox_owned_request_init(pox_owned_request *owned, const pox_http_reque
     owned->script_filename = pox_slice_string(request->script_filename);
     owned->server_name = pox_slice_string(request->server_name);
     owned->remote_addr = pox_slice_string(request->remote_addr);
-    owned->content_type = pox_content_type(owned->headers);
+    owned->content_type = pox_header_value(owned->headers, "Content-Type:");
+    owned->authorization = pox_header_value(owned->headers, "Authorization:");
     if (request->body.len > 0) {
         owned->body = malloc(request->body.len);
         if (owned->body != NULL && request->body.data != NULL) {
@@ -615,7 +729,7 @@ static int pox_owned_request_init(pox_owned_request *owned, const pox_http_reque
     if (owned->method == NULL || owned->uri == NULL || owned->query_string == NULL ||
         owned->headers == NULL || owned->document_root == NULL ||
         owned->script_filename == NULL || owned->server_name == NULL ||
-        owned->remote_addr == NULL || owned->content_type == NULL ||
+        owned->remote_addr == NULL || owned->content_type == NULL || owned->authorization == NULL ||
         (request->body.len > 0 && owned->body == NULL)) {
         pox_owned_request_free(owned, 0);
         return 0;
@@ -629,19 +743,60 @@ static int pox_owned_request_init(pox_owned_request *owned, const pox_http_reque
     owned->context.request_body = (const char *)owned->body;
     owned->context.request_body_len = request->body.len;
     owned->context.headers = owned->headers;
+    owned->context.authorization = owned->authorization;
     owned->context.document_root = owned->document_root;
     owned->context.script_filename = owned->script_filename;
     owned->context.server_name = owned->server_name;
     owned->context.server_port = request->server_port;
     owned->context.remote_addr = owned->remote_addr;
     owned->context.remote_port = request->remote_port;
+    owned->context.secure = (request->reserved0 & POX_HTTP_SECURE) != 0;
+    owned->context.protocol_num = (request->reserved0 & POX_HTTP_PROTOCOL) ? request->reserved[2] : 1001;
+    if (request->reserved0 & POX_HTTP_CANCELLATION) {
+        uintptr_t address = (uintptr_t)((uint64_t)request->reserved[3] | ((uint64_t)request->reserved[4] << 32));
+        owned->context.cancellation = (pox_cancellation *)address;
+        if (owned->context.cancellation != NULL) {
+            atomic_fetch_add(&owned->context.cancellation->references, 1);
+        }
+    }
+    if (request->reserved0 & POX_HTTP_RESPONSE_OUTPUT) {
+        uintptr_t address = (uintptr_t)((uint64_t)request->reserved[5] | ((uint64_t)request->reserved[6] << 32));
+        const pox_output_callbacks_v1 *output = (const pox_output_callbacks_v1 *)address;
+        if (output == NULL || output->struct_size < sizeof(*output) ||
+            output->start == NULL || output->write == NULL || output->flush == NULL) {
+            pox_owned_request_free(owned, 0);
+            return 0;
+        }
+        owned->context.output = output;
+    }
     owned->context.response_status = 200;
+    owned->context.max_response_body = 32u * 1024u * 1024u;
+    owned->context.max_response_headers = 32u * 1024u;
+    if (request->reserved0 & POX_HTTP_RESPONSE_LIMITS) {
+        owned->context.max_response_body = request->reserved[0];
+        owned->context.max_response_headers = request->reserved[1];
+    }
     return 1;
 }
 
 static void pox_response_view(const pox_request_context *context, pox_http_response_v1 *response) {
     memset(response, 0, sizeof(*response));
     response->struct_size = sizeof(*response);
+    if (context->cancellation_rejected || pox_cancellation_requested(context->cancellation)) {
+        response->status = 502;
+        response->reserved0 = POX_RESPONSE_CANCELLED;
+        return;
+    }
+    if (context->output_failed) {
+        response->status = 502;
+        response->reserved0 = POX_RESPONSE_OUTPUT_FAILED;
+        return;
+    }
+    if (context->response_buffer_failed) {
+        response->status = 502;
+        response->reserved0 = POX_RESPONSE_BUFFER_FAILED;
+        return;
+    }
     response->status = (uint16_t)context->response_status;
     response->headers.data = (uint8_t *)context->response_headers;
     response->headers.len = context->response_headers_len;
@@ -652,56 +807,104 @@ static void pox_response_view(const pox_request_context *context, pox_http_respo
 /* Thread-local request context for the web SAPI */
 static __thread pox_request_context *current_request = NULL;
 
-/* Append to response body buffer */
+/* On overflow/allocation failure discard the entire response. Never return a
+ * success status with a truncated body or incomplete headers. Further writes
+ * are consumed without allocation until the PHP request completes. */
+static void pox_response_buffer_failed(void) {
+    current_request->response_buffer_failed = 1;
+    pox_free_response(current_request);
+    current_request->response_body_len = current_request->response_body_cap = 0;
+    current_request->response_headers_len = current_request->response_headers_cap = 0;
+}
+
 static void append_response_body(const char *data, size_t len) {
-    if (current_request == NULL) return;
-
-    /* Grow buffer if needed */
-    while (current_request->response_body_len + len >= current_request->response_body_cap) {
-        size_t new_cap = current_request->response_body_cap * 2;
-        if (new_cap == 0) new_cap = 8192;
-        char *new_buf = realloc(current_request->response_body, new_cap);
-        if (new_buf == NULL) return;
-        current_request->response_body = new_buf;
-        current_request->response_body_cap = new_cap;
+    if (current_request == NULL || current_request->response_buffer_failed || len == 0) return;
+    if (!pox_response_reserve(&current_request->response_body,
+                              &current_request->response_body_cap,
+                              current_request->response_body_len, len,
+                              current_request->max_response_body)) {
+        pox_response_buffer_failed();
+        return;
     }
-
     memcpy(current_request->response_body + current_request->response_body_len, data, len);
     current_request->response_body_len += len;
 }
 
-/* Append to response headers buffer */
 static void append_response_header(const char *header, size_t len) {
-    if (current_request == NULL) return;
-
-    /* Add newline after header */
-    size_t total_len = len + 1;
-
-    /* Grow buffer if needed */
-    while (current_request->response_headers_len + total_len >= current_request->response_headers_cap) {
-        size_t new_cap = current_request->response_headers_cap * 2;
-        if (new_cap == 0) new_cap = 4096;
-        char *new_buf = realloc(current_request->response_headers, new_cap);
-        if (new_buf == NULL) return;
-        current_request->response_headers = new_buf;
-        current_request->response_headers_cap = new_cap;
+    if (current_request == NULL || current_request->response_buffer_failed) return;
+    if (len == SIZE_MAX || !pox_response_reserve(&current_request->response_headers,
+                              &current_request->response_headers_cap,
+                              current_request->response_headers_len, len + 1,
+                              current_request->max_response_headers)) {
+        pox_response_buffer_failed();
+        return;
     }
-
     memcpy(current_request->response_headers + current_request->response_headers_len, header, len);
     current_request->response_headers_len += len;
     current_request->response_headers[current_request->response_headers_len++] = '\n';
 }
 
+/* Start only after SAPI has serialized its final headers. No body allocation
+ * occurs on this opt-in path; the sink provides synchronous backpressure. */
+static int pox_output_start(pox_request_context *ctx) {
+    if (ctx->output == NULL || ctx->response_buffer_failed || ctx->output_failed ||
+        ctx->cancellation_rejected || pox_cancellation_requested(ctx->cancellation)) return 0;
+    if (!ctx->output_started) {
+        pox_slice_v1 headers = {(const uint8_t *)ctx->response_headers, ctx->response_headers_len};
+        ctx->output_started = 1;
+        if (!ctx->output->start(ctx->output->userdata, (uint16_t)ctx->response_status, headers)) {
+            ctx->output_failed = 1;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* SAPI: Unbuffered write - captures PHP output */
 static size_t pox_web_ub_write(const char *str, size_t str_length) {
-    append_response_body(str, str_length);
+    if (current_request != NULL && current_request->output != NULL) {
+        if (current_request->output_bytes > current_request->max_response_body ||
+            str_length > current_request->max_response_body - current_request->output_bytes) {
+            pox_response_buffer_failed();
+            return str_length;
+        }
+        if (!pox_output_start(current_request)) {
+            if (current_request->output_failed) php_handle_aborted_connection();
+            return str_length;
+        }
+        size_t offset = 0;
+        while (offset < str_length) {
+            size_t length = str_length - offset;
+            if (length > 16384) length = 16384;
+            pox_slice_v1 chunk = {(const uint8_t *)str + offset, length};
+            if (!current_request->output->write(current_request->output->userdata, chunk)) {
+                current_request->output_failed = 1;
+                php_handle_aborted_connection();
+                break;
+            }
+            current_request->output_bytes += length;
+            offset += length;
+        }
+    } else {
+        append_response_body(str, str_length);
+    }
     return str_length;
 }
 
 /* SAPI: Flush output */
 static void pox_web_sapi_flush(void *server_context) {
-    /* We buffer everything, so flush is a no-op */
     (void)server_context;
+    if (current_request != NULL && current_request->output != NULL) {
+        if (!SG(headers_sent)) sapi_send_headers();
+        if (!pox_output_start(current_request)) {
+            if (current_request->output_failed) php_handle_aborted_connection();
+            return;
+        }
+        if (!current_request->output->flush(current_request->output->userdata)) {
+            current_request->output_failed = 1;
+            php_handle_aborted_connection();
+        }
+    }
 }
 
 /* SAPI: Send headers */
@@ -710,15 +913,10 @@ static int pox_web_send_headers(sapi_headers_struct *sapi_headers) {
         return SAPI_HEADER_SENT_SUCCESSFULLY;
     }
 
-    /* Get status code */
-    if (SG(sapi_headers).http_status_line) {
-        current_request->response_status = atoi((SG(sapi_headers).http_status_line) + 9);
-    } else {
-        current_request->response_status = SG(sapi_headers).http_response_code;
-        if (current_request->response_status == 0) {
-            current_request->response_status = 200;
-        }
-    }
+    /* PHP already parsed the status. A fixed offset into http_status_line
+     * can read past short user-supplied strings such as header("HTTP/"). */
+    current_request->response_status = SG(sapi_headers).http_response_code;
+    if (current_request->response_status == 0) current_request->response_status = 200;
 
     /* Collect headers */
     zend_llist_element *element = sapi_headers->headers.head;
@@ -776,9 +974,12 @@ static char *pox_web_read_cookies(void) {
             /* Calculate value length (exclude newline) */
             size_t value_len = line_len - (value - line);
 
-            /* Return a copy (PHP will free this) */
-            char *cookies = estrndup(value, value_len);
-            return cookies;
+            /* SAPI does not free cookie_data. The owned request must do so,
+             * including in persistent workers where Zend's heap survives. */
+            if (current_request->request_cookie_data == NULL) {
+                current_request->request_cookie_data = strndup(value, value_len);
+            }
+            return current_request->request_cookie_data;
         }
 
         if (eol == NULL) break;
@@ -786,6 +987,51 @@ static char *pox_web_read_cookies(void) {
     }
 
     return NULL;
+}
+
+/* Derive CGI script metadata from the entry point rather than the raw URI. */
+static void pox_register_script_variables(zval *variables) {
+    const char *filename = current_request->script_filename ? current_request->script_filename : "";
+    const char *root = current_request->document_root ? current_request->document_root : "";
+    size_t root_len = strlen(root);
+    while (root_len > 0 && root[root_len - 1] == '/') root_len--;
+    const char *relative;
+    size_t filename_len = strlen(filename);
+    if (filename_len > root_len && strncmp(filename, root, root_len) == 0 && filename[root_len] == '/') {
+        relative = filename + root_len;
+    } else {
+        const char *basename = strrchr(filename, '/');
+        relative = basename != NULL ? basename : filename;
+    }
+    char *script_name;
+    spprintf(&script_name, 0, "%s%s", relative[0] == '/' ? "" : "/", relative);
+    const char *uri = current_request->uri ? current_request->uri : "/";
+    size_t uri_len = strcspn(uri, "?");
+    char *path = estrndup(uri, uri_len);
+    /* Path decoding keeps '+' literal, unlike form decoding. */
+    php_raw_url_decode(path, uri_len);
+    size_t script_len = strlen(script_name);
+    const char *info = "";
+    if (strlen(path) > script_len && strncmp(path, script_name, script_len) == 0 && path[script_len] == '/') {
+        info = path + script_len;
+    }
+    php_register_variable_safe("SCRIPT_NAME", script_name, script_len, variables);
+    char *self;
+    spprintf(&self, 0, "%s%s", script_name, info);
+    php_register_variable_safe("PHP_SELF", self, strlen(self), variables);
+    if (*info != '\0') {
+        php_register_variable_safe("PATH_INFO", (char *)info, strlen(info), variables);
+        char *translated;
+        spprintf(&translated, 0, "%.*s%s", (int)root_len, root, info);
+        php_register_variable_safe("PATH_TRANSLATED", translated, strlen(translated), variables);
+        efree(translated);
+    } else {
+        zend_hash_str_del(Z_ARRVAL_P(variables), ZEND_STRL("PATH_INFO"));
+        zend_hash_str_del(Z_ARRVAL_P(variables), ZEND_STRL("PATH_TRANSLATED"));
+    }
+    efree(self);
+    efree(path);
+    efree(script_name);
 }
 
 /* SAPI: Register server variables ($_SERVER) */
@@ -812,13 +1058,7 @@ static void pox_web_register_variables(zval *track_vars_array) {
         (char *)(current_request->script_filename ? current_request->script_filename : ""),
         current_request->script_filename ? strlen(current_request->script_filename) : 0, track_vars_array);
 
-    php_register_variable_safe("SCRIPT_NAME",
-        (char *)(current_request->uri ? current_request->uri : "/"),
-        current_request->uri ? strlen(current_request->uri) : 1, track_vars_array);
-
-    php_register_variable_safe("PHP_SELF",
-        (char *)(current_request->uri ? current_request->uri : "/"),
-        current_request->uri ? strlen(current_request->uri) : 1, track_vars_array);
+    pox_register_script_variables(track_vars_array);
 
     php_register_variable_safe("DOCUMENT_ROOT",
         (char *)(current_request->document_root ? current_request->document_root : ""),
@@ -840,9 +1080,21 @@ static void pox_web_register_variables(zval *track_vars_array) {
     snprintf(remote_port_str, sizeof(remote_port_str), "%d", current_request->remote_port);
     php_register_variable_safe("REMOTE_PORT", remote_port_str, strlen(remote_port_str), track_vars_array);
 
-    php_register_variable_safe("SERVER_SOFTWARE", "pox", 4, track_vars_array);
-    php_register_variable_safe("SERVER_PROTOCOL", "HTTP/1.1", 8, track_vars_array);
+    if (current_request->secure) {
+        php_register_variable_safe("HTTPS", "on", 2, track_vars_array);
+    } else {
+        zend_hash_str_del(Z_ARRVAL_P(track_vars_array), ZEND_STRL("HTTPS"));
+    }
+    php_register_variable_safe("REQUEST_SCHEME", current_request->secure ? "https" : "http", current_request->secure ? 5 : 4, track_vars_array);
+    php_register_variable_safe("SERVER_SOFTWARE", "pox", 3, track_vars_array);
+    php_register_variable_safe("SERVER_PROTOCOL", current_request->protocol_num == 1000 ? "HTTP/1.0" : "HTTP/1.1", 8, track_vars_array);
     php_register_variable_safe("GATEWAY_INTERFACE", "CGI/1.1", 7, track_vars_array);
+    if (SG(request_info).auth_user != NULL) {
+        php_register_variable_safe("AUTH_TYPE", "Basic", 5, track_vars_array);
+    } else if (SG(request_info).auth_digest != NULL) {
+        php_register_variable_safe("AUTH_TYPE", "Digest", 6, track_vars_array);
+    }
+
 
     if (current_request->content_type) {
         php_register_variable_safe("CONTENT_TYPE",
@@ -904,6 +1156,56 @@ static void pox_web_register_variables(zval *track_vars_array) {
 }
 
 /* SAPI startup handler */
+/* Emit one bounded record so concurrent PHP failures remain diagnosable.
+ * Preserve valid UTF-8 and escape arbitrary invalid bytes from PHP messages. */
+static void pox_http_log_message(const char *message, int severity) {
+    if (message == NULL) return;
+    char line[4096];
+    size_t used = (size_t)snprintf(line, sizeof(line),
+        "{\"event\":\"php_error\",\"severity\":%d,\"message\":\"", severity);
+    const unsigned char *cursor = (const unsigned char *)message;
+    while (*cursor && used + 48 < sizeof(line)) {
+        unsigned char byte = *cursor++;
+        if (byte == '"' || byte == '\\') {
+            line[used++] = '\\';
+            line[used++] = byte;
+        } else if (byte >= 128) {
+            size_t length = byte >= 0xc2 && byte <= 0xdf ? 2 :
+                byte >= 0xe0 && byte <= 0xef ? 3 : byte >= 0xf0 && byte <= 0xf4 ? 4 : 0;
+            int valid = length != 0;
+            for (size_t i = 1; valid && i < length; i++) {
+                if ((cursor[i - 1] & 0xc0) != 0x80) valid = 0;
+            }
+            if (valid && ((byte == 0xe0 && cursor[0] < 0xa0) ||
+                (byte == 0xed && cursor[0] >= 0xa0) ||
+                (byte == 0xf0 && cursor[0] < 0x90) ||
+                (byte == 0xf4 && cursor[0] >= 0x90))) valid = 0;
+            if (valid) {
+                line[used++] = byte;
+                memcpy(line + used, cursor, length - 1);
+                used += length - 1;
+                cursor += length - 1;
+            } else {
+                used += (size_t)snprintf(line + used, sizeof(line) - used, "\\u%04x", byte);
+            }
+        } else if (byte < 32 || byte == 127) {
+            used += (size_t)snprintf(line + used, sizeof(line) - used, "\\u%04x", byte);
+        } else {
+            line[used++] = byte;
+        }
+    }
+    used += (size_t)snprintf(line + used, sizeof(line) - used,
+        "\",\"truncated\":%s}\n", *cursor ? "true" : "false");
+    fwrite(line, 1, used, stderr);
+}
+
+static int pox_http_activate(void) {
+    /* sapi_activate resets proto_num before invoking this hook. */
+    SG(request_info).proto_num = current_request && current_request->protocol_num == 1000 ? 1000 : 1001;
+    php_handle_auth_data(current_request ? current_request->authorization : NULL);
+    return SUCCESS;
+}
+
 static int pox_web_startup(sapi_module_struct *sapi_module) {
     return php_module_startup(sapi_module, NULL);
 }
@@ -916,7 +1218,7 @@ static sapi_module_struct pox_web_sapi_module = {
     pox_web_startup,               /* startup */
     php_module_shutdown_wrapper,    /* shutdown */
 
-    NULL,                           /* activate */
+    pox_http_activate,              /* activate */
     NULL,                           /* deactivate */
 
     pox_web_ub_write,              /* unbuffered write */
@@ -934,7 +1236,7 @@ static sapi_module_struct pox_web_sapi_module = {
     pox_web_read_cookies,          /* read Cookies */
 
     pox_web_register_variables,    /* register server variables */
-    NULL,                           /* Log message */
+    pox_http_log_message,           /* Log message */
     NULL,                           /* Get request time */
     NULL,                           /* Child terminate */
 
@@ -942,6 +1244,7 @@ static sapi_module_struct pox_web_sapi_module = {
 };
 
 static int pox_web_initialized = 0;
+static __thread int pox_web_thread_attached = 0;
 
 /*
  * Initialize the web SAPI (call once at server startup).
@@ -979,6 +1282,9 @@ void pox_web_shutdown(void) {
 
     php_module_shutdown();
     sapi_shutdown();
+#ifdef ZTS
+    tsrm_shutdown();
+#endif
     pox_web_initialized = 0;
 }
 
@@ -993,7 +1299,15 @@ int pox_web_execute(pox_request_context *ctx) {
         }
     }
 
+#ifdef ZTS
+    /* Web initialization/shutdown belong to the owner. Request execution may
+     * run on joined dispatch threads, each with independent PHP globals. */
+    (void)ts_resource(0);
+    ZEND_TSRMLS_CACHE_UPDATE();
+#endif
+
     current_request = ctx;
+    EG(exit_status) = 0;
 
     /* Initialize response buffers */
     ctx->response_body = NULL;
@@ -1025,6 +1339,11 @@ int pox_web_execute(pox_request_context *ctx) {
             /* Apply INI entries */
             pox_apply_ini_entries();
 
+            if (!pox_cancellation_bind(ctx->cancellation)) {
+                ctx->cancellation_rejected = 1;
+                zend_bailout();
+            }
+            ctx->cancellation_bound = 1;
             /* Execute the script */
             zend_file_handle file_handle;
             zend_stream_init_filename(&file_handle, ctx->script_filename);
@@ -1040,7 +1359,17 @@ int pox_web_execute(pox_request_context *ctx) {
         php_request_shutdown(NULL);
     } zend_end_try();
 
+    if (result == 0) result = EG(exit_status);
+    if (ctx->output != NULL && ctx->output_started && result != 0) ctx->output_failed = 1;
+    if (ctx->output != NULL) pox_output_start(ctx);
+    if (ctx->cancellation_bound) pox_cancellation_detach(ctx->cancellation);
+    SG(server_context) = NULL;
+    sapi_initialize_empty_request();
     current_request = NULL;
+
+#ifdef ZTS
+    if (!tsrm_is_main_thread() && !pox_web_thread_attached) ts_free_thread();
+#endif
 
     return result;
 }
@@ -1074,12 +1403,91 @@ void pox_free_response(pox_request_context *ctx) {
 typedef struct {
     int is_worker_mode;           /* Are we in worker mode? */
     int waiting_for_request;      /* Is worker waiting for a request? */
+    int request_active;
     pox_request_context *pending_request;  /* The pending request to handle */
 } pox_worker_state;
 
 static __thread pox_worker_state worker_state = {0};
 static __thread const pox_worker_callbacks_v1 *pox_worker_callbacks = NULL;
 static __thread pox_owned_request pox_worker_request = {0};
+
+/* Reload only extensions whose state represents one HTTP request. Other
+ * extensions and application globals retain their worker-lifetime state. */
+static void pox_worker_request_modules(int startup) {
+    const char *names[] = {"filter",
+#ifndef HAVE_PHP_SESSION
+        "session",
+#endif
+        NULL};
+#ifdef HAVE_PHP_SESSION
+    /* Preserve bootstrap save-handler objects and closures for this worker,
+     * while flushing and releasing each client's session state. */
+    if (startup) {
+        if (PS(auto_start)) php_session_start();
+    } else {
+        if (PS(session_status) == php_session_active) php_session_flush(1);
+        if (!Z_ISUNDEF(PS(http_session_vars))) {
+            zval_ptr_dtor(&PS(http_session_vars));
+            ZVAL_UNDEF(&PS(http_session_vars));
+        }
+        if (PS(mod) && (PS(mod_data) || PS(mod_user_implemented))) {
+            PS(mod)->s_close(&PS(mod_data));
+        }
+        if (PS(id)) { zend_string_release(PS(id)); PS(id) = NULL; }
+        if (PS(session_vars)) { zend_string_release(PS(session_vars)); PS(session_vars) = NULL; }
+#if PHP_VERSION_ID >= 80300
+        if (PS(session_started_filename)) {
+            zend_string_release(PS(session_started_filename));
+            PS(session_started_filename) = NULL;
+            PS(session_started_lineno) = 0;
+        }
+#endif
+        PS(session_status) = PS(mod) && PS(serializer) ? php_session_none : php_session_disabled;
+        PS(in_save_handler) = 0;
+        PS(set_handler) = 0;
+        PS(mod_data) = NULL;
+        PS(mod_user_is_open) = 0;
+        PS(define_sid) = 1;
+    }
+#endif
+    for (const char **name = names; *name; name++) {
+        zend_module_entry *module = zend_hash_str_find_ptr(&module_registry, *name, strlen(*name));
+        if (module == NULL) continue;
+        if (startup && module->request_startup_func) {
+            if (module->request_startup_func(module->type, module->module_number) == FAILURE) zend_bailout();
+        } else if (!startup && module->request_shutdown_func) {
+            module->request_shutdown_func(module->type, module->module_number);
+        }
+    }
+}
+
+static void pox_worker_deactivate_request(void) {
+    if (!worker_state.request_active) return;
+    php_output_end_all();
+    pox_worker_request_modules(0);
+    if (!SG(headers_sent)) sapi_send_headers();
+    php_output_deactivate();
+    sapi_deactivate();
+    /* sapi_deactivate frees these but doesn't null them, whereas the worker
+     * can subsequently undergo full PHP shutdown without another activation. */
+    SG(request_info).content_type_dup = NULL;
+    SG(request_info).current_user = NULL;
+    SG(request_info).current_user_length = 0;
+    SG(request_info).cookie_data = NULL;
+    SG(server_context) = NULL;
+    sapi_initialize_empty_request();
+    worker_state.request_active = 0;
+
+    /* SAPI detached php://input storage. Release only unexposed temporary
+     * streams without an application reference; never close user-held streams. */
+    zend_resource *resource;
+    ZEND_HASH_FOREACH_PTR(&EG(regular_list), resource) {
+        if (resource->type == php_file_le_stream() && resource->ptr != NULL && GC_REFCOUNT(resource) == 1) {
+            php_stream *stream = resource->ptr;
+            if (stream->ops == &php_stream_temp_ops && stream->__exposed == 0) zend_list_delete(resource);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
 
 /*
  * PHP function: pox_handle_request(callable $callback): bool
@@ -1106,6 +1514,14 @@ PHP_FUNCTION(pox_handle_request) {
             "pox_handle_request() called while not in worker mode", 0);
         RETURN_THROWS();
     }
+
+    /* Deactivate the bootstrap request before accepting the first client. */
+    pox_worker_deactivate_request();
+
+#ifdef ZEND_MAX_EXECUTION_TIMERS
+    /* Idle time belongs to the host, not to a PHP request's execution budget. */
+    zend_unset_timeout();
+#endif
 
     /* Signal we're waiting and wait for a request from Rust */
     worker_state.waiting_for_request = 1;
@@ -1152,6 +1568,23 @@ PHP_FUNCTION(pox_handle_request) {
     current_request->response_status = 200;
     current_request->request_body_read = 0;
 
+#ifdef ZEND_MAX_EXECUTION_TIMERS
+    /* Each callback gets the currently configured PHP execution budget. Clear
+     * the previous timer first, including when the new budget is unlimited. */
+    zend_unset_timeout();
+#if PHP_VERSION_ID < 80600
+    zend_set_timeout(INI_INT("max_execution_time"), 0);
+#else
+    zend_set_timeout(zend_ini_long_literal("max_execution_time"), 0);
+#endif
+#endif
+
+    if (!pox_cancellation_bind(current_request->cancellation)) {
+        current_request->cancellation_rejected = 1;
+        zend_bailout();
+    }
+    current_request->cancellation_bound = 1;
+    PG(connection_status) = PHP_CONNECTION_NORMAL;
     /* Re-initialize request info from the new request */
     SG(request_info).request_method = current_request->method;
     SG(request_info).query_string = (char *)current_request->query_string;
@@ -1165,50 +1598,25 @@ PHP_FUNCTION(pox_handle_request) {
     SG(headers_sent) = 0;
     SG(read_post_bytes) = 0;  /* Reset POST read counter */
 
-    /* Activate SAPI for the new request - this populates $_POST, $_COOKIE, etc. */
+    php_output_activate();
+    worker_state.request_active = 1;
+    /* Upload globals have no clearing callback; sessions live in the symbol
+     * table instead of PG(http_globals). Remove their previous request values. */
+    zval_ptr_dtor_nogc(&PG(http_globals)[TRACK_VARS_FILES]);
+    ZVAL_UNDEF(&PG(http_globals)[TRACK_VARS_FILES]);
+    zend_hash_str_del(&EG(symbol_table), ZEND_STRL("_SESSION"));
     sapi_activate();
 
-    /* Reset auto globals to reimport $_SERVER, $_GET, $_POST, $_COOKIE, $_FILES
-     * This is the proper way to refresh superglobals in worker mode.
-     * See FrankenPHP's frankenphp_reset_super_globals() for reference. */
     zend_auto_global *auto_global;
     ZEND_HASH_MAP_FOREACH_PTR(CG(auto_globals), auto_global) {
-        /* Skip $_ENV - we don't want to reset environment variables */
-        if (zend_string_equals_literal(auto_global->name, "_ENV")) {
-            continue;
-        }
-
-        /* For $_SERVER, always reimport */
-        if (zend_string_equals_literal(auto_global->name, "_SERVER")) {
-            if (auto_global->auto_global_callback) {
-                auto_global->armed = auto_global->auto_global_callback(auto_global->name);
-            }
-            continue;
-        }
-
-        /* Skip JIT globals except when they have a callback
-         * JIT globals (like $_REQUEST, $GLOBALS) are only populated on script parse */
-        if (auto_global->jit) {
-            continue;
-        }
-
-        /* Reimport $_GET, $_POST, $_COOKIE, $_FILES via their callbacks */
+        if (zend_string_equals_literal(auto_global->name, "_ENV")) continue;
+        /* Reimport $_REQUEST too, even when it was materialized during worker
+         * bootstrap. Leave $GLOBALS and application objects intact. */
         if (auto_global->auto_global_callback) {
             auto_global->armed = auto_global->auto_global_callback(auto_global->name);
         }
-    }
-    ZEND_HASH_FOREACH_END();
-
-    /* Clear output buffers */
-    if (OG(handlers).elements) {
-        php_output_end_all();
-    }
-    php_output_activate();
-
-    /* Disable timeout in worker mode (we're in a Rust-managed thread) */
-#ifdef ZEND_MAX_EXECUTION_TIMERS
-    zend_unset_timeout();
-#endif
+    } ZEND_HASH_FOREACH_END();
+    pox_worker_request_modules(1);
 
     /* Call the callback function */
     zval retval = {0};
@@ -1220,24 +1628,26 @@ PHP_FUNCTION(pox_handle_request) {
     if (zend_call_function(&fci, &fcc) == SUCCESS) {
         /* Handle any exception */
         if (EG(exception)) {
-            if (!zend_is_unwind_exit(EG(exception)) &&
-                !zend_is_graceful_exit(EG(exception))) {
-                zend_exception_error(EG(exception), E_ERROR);
+            if (zend_is_unwind_exit(EG(exception)) ||
+                zend_is_graceful_exit(EG(exception))) {
+                /* exit() ends this worker incarnation; do not turn an
+                 * interrupted callback into an empty successful response. */
+                zend_bailout();
             }
-            zend_clear_exception();
+            zend_exception_error(EG(exception), E_ERROR);
+            /* Some error handlers return after rendering the uncaught error.
+             * The callback still failed and its worker must not be reused. */
+            zend_bailout();
         }
     }
 
     zval_ptr_dtor(&retval);
 
-    /* Flush output */
-    php_output_end_all();
+    /* Complete request-specific cleanup before publishing the response. */
+    pox_worker_deactivate_request();
 
-    /* Send headers if not already sent */
-    if (!SG(headers_sent)) {
-        sapi_send_headers();
-    }
-
+    if (current_request->output != NULL) pox_output_start(current_request);
+    pox_cancellation_detach(current_request->cancellation);
     /* Copy the response through the versioned callback before releasing it. */
     pox_http_response_v1 response;
     pox_response_view(current_request, &response);
@@ -1287,7 +1697,7 @@ static sapi_module_struct pox_worker_sapi_module = {
     pox_worker_startup,            /* startup - register our extension */
     php_module_shutdown_wrapper,    /* shutdown */
 
-    NULL,                           /* activate */
+    pox_http_activate,              /* activate */
     NULL,                           /* deactivate */
 
     pox_web_ub_write,              /* unbuffered write */
@@ -1305,7 +1715,7 @@ static sapi_module_struct pox_worker_sapi_module = {
     pox_web_read_cookies,          /* read Cookies */
 
     pox_web_register_variables,    /* register server variables */
-    NULL,                           /* Log message */
+    pox_http_log_message,           /* Log message */
     NULL,                           /* Get request time */
     NULL,                           /* Child terminate */
 
@@ -1396,6 +1806,8 @@ int pox_worker_run(const char *script_filename, const char *document_root) {
 
     /* Create a dummy request context for the initial script execution */
     pox_request_context dummy_ctx = {0};
+    dummy_ctx.max_response_body = 32u * 1024u * 1024u;
+    dummy_ctx.max_response_headers = 32u * 1024u;
     dummy_ctx.method = "GET";
     dummy_ctx.uri = "/";
     dummy_ctx.query_string = "";
@@ -1427,6 +1839,7 @@ int pox_worker_run(const char *script_filename, const char *document_root) {
         } else {
             pox_apply_ini_entries();
 
+            worker_state.request_active = 1;
             /* Execute the worker script */
             zend_file_handle file_handle;
             zend_stream_init_filename(&file_handle, script_filename);
@@ -1443,7 +1856,17 @@ int pox_worker_run(const char *script_filename, const char *document_root) {
     } zend_end_try();
 
     current_request = NULL;
+    worker_state.pending_request = NULL;
     worker_state.is_worker_mode = 0;
+    worker_state.request_active = 0;
+    if (pox_worker_request.context.cancellation_bound) pox_cancellation_detach(pox_worker_request.context.cancellation);
+    /* Fatal/exit paths can bypass complete_response and its ordinary cleanup. */
+    pox_owned_request_free(&pox_worker_request, 1);
+    pox_free_response(&dummy_ctx);
+    free(dummy_ctx.request_cookie_data);
+#ifdef ZTS
+    ts_free_thread();
+#endif
 
     return result;
 }
@@ -1459,6 +1882,9 @@ static void pox_worker_global_shutdown(void) {
     if (!pox_worker_global_initialized) return;
     php_module_shutdown();
     sapi_shutdown();
+#ifdef ZTS
+    tsrm_shutdown();
+#endif
     pox_worker_global_initialized = 0;
 }
 
@@ -1581,7 +2007,7 @@ static int32_t pox_abi_metadata_json(pox_buffer_v1 *output) {
         pox_json_string(&json, POX_RUNTIME_REVISION) &&
         pox_json_append(&json, ",\"target\":") &&
         pox_json_string(&json, POX_RUNTIME_TARGET) &&
-        pox_json_append(&json, ",\"abi_major\":1,\"abi_minor\":0,\"extensions\":[");
+        pox_json_append(&json, ",\"abi_major\":1,\"abi_minor\":1,\"extensions\":[");
 
     int first = 1;
     char *line = extensions;
@@ -1719,10 +2145,36 @@ static int32_t pox_abi_web_execute(void *runtime, const pox_http_request_v1 *req
     }
     *exit_code = pox_web_execute(&owned.context);
     pox_response_view(&owned.context, response);
+    if (response->reserved0 & (POX_RESPONSE_CANCELLED | POX_RESPONSE_OUTPUT_FAILED)) pox_free_response(&owned.context);
     owned.context.response_headers = NULL;
     owned.context.response_body = NULL;
     pox_owned_request_free(&owned, 0);
     return POX_STATUS_OK;
+}
+
+static int32_t pox_abi_web_thread_enter(void *runtime) {
+#ifdef ZTS
+    if (runtime == NULL || !pox_web_initialized || pox_web_thread_attached || tsrm_is_main_thread()) {
+        pox_set_error("web thread attachment requires an unattached dispatch thread");
+        return POX_STATUS_INVALID_ARGUMENT;
+    }
+    if (ts_resource(0) == NULL) return POX_STATUS_OUT_OF_MEMORY;
+    ZEND_TSRMLS_CACHE_UPDATE();
+    pox_web_thread_attached = 1;
+    return POX_STATUS_OK;
+#else
+    return POX_STATUS_INVALID_ARGUMENT;
+#endif
+}
+
+static void pox_abi_web_thread_leave(void *runtime) {
+    (void)runtime;
+#ifdef ZTS
+    if (pox_web_thread_attached) {
+        pox_web_thread_attached = 0;
+        ts_free_thread();
+    }
+#endif
 }
 
 static void pox_abi_web_destroy(void *runtime) {
@@ -1779,7 +2231,11 @@ static const pox_php_api_v1 POX_PHP_API = {
     .struct_size = sizeof(pox_php_api_v1),
     .abi_major = POX_PHP_ABI_MAJOR,
     .abi_minor = POX_PHP_ABI_MINOR,
-    .feature_flags = 0,
+    .feature_flags = POX_FEATURE_RESPONSE_OUTPUT | POX_FEATURE_CANCELLATION | POX_FEATURE_RESPONSE_LIMITS | POX_FEATURE_HTTP_PROTOCOL | POX_FEATURE_REQUEST_SCHEME
+#ifdef ZTS
+        | POX_FEATURE_PARALLEL_WEB | POX_FEATURE_WEB_THREADS
+#endif
+        ,
     .metadata_json = pox_abi_metadata_json,
     .last_error = pox_abi_last_error,
     .free_buffer = pox_abi_free_buffer,
@@ -1791,6 +2247,11 @@ static const pox_php_api_v1 POX_PHP_API = {
     .worker_create = pox_abi_worker_create,
     .worker_run = pox_abi_worker_run,
     .worker_destroy = pox_abi_worker_destroy,
+    .web_thread_enter = pox_abi_web_thread_enter,
+    .web_thread_leave = pox_abi_web_thread_leave,
+    .cancellation_create = pox_cancellation_create,
+    .cancellation_request = pox_cancellation_request,
+    .cancellation_release = pox_cancellation_release,
     .reserved = {0}
 };
 

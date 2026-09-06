@@ -19,3 +19,7 @@ jobs:
           bash -n scripts/*.sh tests/*.sh
           python3 -m compileall -q scripts
           cc -std=c11 -Iinclude -fsyntax-only tests/smoke.c
+      - name: Verify response allocation bounds
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror tests/response-buffer.c -o /tmp/pox-response-buffer-test
+          /tmp/pox-response-buffer-test
