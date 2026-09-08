@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly PHP_VERSION="${PHP_VERSION:?PHP_VERSION is required}"
-readonly RUNTIME_REVISION="${RUNTIME_REVISION:-r2}"
+readonly RUNTIME_REVISION="${RUNTIME_REVISION:-r3}"
 readonly TARGET="${TARGET:?TARGET is required}"
 readonly BUILD_DIR="${BUILD_DIR:-build}"
 readonly SPC_DIR="${SPC_DIR:-.spc}"

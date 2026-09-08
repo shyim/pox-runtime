@@ -11,7 +11,7 @@ on:
         type: string
       runtime_revision:
         description: Runtime adapter revision
-        default: r2
+        default: r3
         required: true
         type: string
 
@@ -37,7 +37,7 @@ jobs:
             versions="$(scripts/discover-versions.py)"
           fi
           echo "versions=${versions}" >> "${GITHUB_OUTPUT}"
-          echo "revision=${REQUESTED_REVISION:-r2}" >> "${GITHUB_OUTPUT}"
+          echo "revision=${REQUESTED_REVISION:-r3}" >> "${GITHUB_OUTPUT}"
 
   build:
     needs: discover
@@ -147,6 +147,7 @@ jobs:
               echo "${tag} already exists; keeping immutable release assets"
             else
               gh release create "${tag}" dist/pox-php-${version}-${REVISION}-*.tar.zst dist/release.json \
+                --target "${GITHUB_SHA}" \
                 --title "PHP ${version} runtime ${REVISION}" \
                 --notes "Self-contained ZTS/embed PHP ${version} runtimes for Pox."
             fi
