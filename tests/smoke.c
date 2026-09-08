@@ -26,7 +26,17 @@ int main(int argc, char **argv) {
     get_api_fn get_api = (get_api_fn)dlsym(library, "pox_php_get_api");
     if (get_api == NULL) return 1;
     const pox_php_api_v1 *api = get_api(1, 0);
-    if (api == NULL || api->abi_major != 1 || api->abi_minor < 0) return 1;
+    if (api == NULL || api->abi_major != 1 || api->abi_minor < POX_PHP_ABI_MINOR) return 1;
+
+    if (get_api(1, POX_PHP_ABI_MINOR) != api || get_api(1, POX_PHP_ABI_MINOR + 1) != NULL) return 1;
+    if (!(api->feature_flags & POX_FEATURE_RESPONSE_LIMITS)) return 1;
+
+    if (!(api->feature_flags & POX_FEATURE_CANCELLATION) ||
+        api->cancellation_create == NULL || api->cancellation_request == NULL ||
+        api->cancellation_release == NULL) return 1;
+    void *control = NULL;
+    if (api->cancellation_create(&control) != POX_STATUS_OK || control == NULL) return 1;
+    api->cancellation_request(control);
 
     pox_buffer_v1 metadata = {0};
     if (api->metadata_json(&metadata) != POX_STATUS_OK) return 1;
@@ -43,6 +53,8 @@ int main(int argc, char **argv) {
     request.source.len = strlen(code);
     int32_t exit_code = -1;
     if (api->execute_cli(&request, &exit_code) != POX_STATUS_OK || exit_code != 0) return 1;
+    api->cancellation_request(control);
+    api->cancellation_release(control);
     dlclose(library);
     return 0;
 }

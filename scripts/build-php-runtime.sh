@@ -60,6 +60,7 @@ export SPC_REL_TYPE="binary"
 "${SPC_BIN}" doctor --auto-fix --no-interaction
 "${SPC_BIN}" download \
     --with-php="${PHP_VERSION}" \
+    --ignore-cache-sources=php-src \
     --for-extensions="${PHP_EXTENSIONS}" \
     --for-libs="${PHP_BUILD_LIBS}" \
     --prefer-pre-built \
@@ -70,6 +71,14 @@ export SPC_REL_TYPE="binary"
     --enable-zts \
     --with-libs="${PHP_BUILD_LIBS}" \
     --no-interaction
+
+# SPC may retain a previously extracted/built PHP tree even after selecting a
+# different source version. Refuse to label/package that SDK as the requested PHP.
+readonly BUILT_PHP_VERSION="$("${PWD}/buildroot/bin/php-config" --version)"
+if [[ "${BUILT_PHP_VERSION}" != "${PHP_VERSION}" ]]; then
+    echo "Requested PHP ${PHP_VERSION}, but the built SDK is ${BUILT_PHP_VERSION}. Use an isolated SPC working directory." >&2
+    exit 1
+fi
 
 env PHP_CONFIG="${PWD}/buildroot/bin/php-config" \
     BUILD_DIR="${BUILD_DIR}" \

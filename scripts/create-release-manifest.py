@@ -34,7 +34,7 @@ release = {
     "php_version": args.php_version,
     "runtime_revision": args.runtime_revision,
     "abi_major": 1,
-    "abi_minor": 0,
+    "abi_minor": 1,
     "artifacts": artifacts,
 }
 args.output.write_text(json.dumps(release, indent=2, sort_keys=True) + "\n")

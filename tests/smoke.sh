@@ -13,3 +13,6 @@ else
     "${CC}" -std=c11 -Iinclude tests/smoke.c -ldl -o "${BUILD_DIR}/smoke"
 fi
 "${BUILD_DIR}/smoke" "${BUILD_DIR}/${LIBRARY_NAME}"
+
+"${CC}" -std=c11 -Wall -Wextra -Werror tests/response-buffer.c -o "${BUILD_DIR}/response-buffer-test"
+"${BUILD_DIR}/response-buffer-test"
